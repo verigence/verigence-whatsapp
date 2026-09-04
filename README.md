@@ -10,38 +10,42 @@ Deployed as **two Railway services** from this repository: `api` (webhook) and `
 
 ## Architecture
 
-```
-Meta Cloud API
-      │
-      ▼ POST /wa/webhook  (HMAC-SHA256 verified)
-┌─────────────────────────┐
-│  verigence-whatsapp     │  Railway service: wa-api
-│  FastAPI + uvicorn      │
-│  wa.inbox (no RLS)      │
-└──────────┬──────────────┘
-           │ Procrastinate task dispatch
-           ▼
-┌─────────────────────────┐
-│  verigence-whatsapp     │  Railway service: wa-worker
-│  worker.py              │
-│  Procrastinate tasks    │
-└──────┬──────────────────┘
-       │ HTTP POST /internal/evidence
-       ▼
-┌─────────────────────────┐
-│  verigence-audit-core   │  existing service (unchanged)
-│  Evidence Service       │
-└──────────┬──────────────┘
-           │
-           ▼
-┌─────────────────────────┐
-│  verigence-di           │  existing service (unchanged)
-│  DI pipeline            │
-└─────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Meta ["Meta Cloud API"]
+        M1([WhatsApp Business Number])
+    end
 
-All three services share one Neon Postgres database.
-wa.* and doc.* schemas are owned exclusively by verigence-whatsapp.
+    subgraph WA ["verigence-whatsapp (this repo)"]
+        WA1["wa-api\nFastAPI · uvicorn\nPOST /wa/webhook"]
+        WA2["wa-worker\nProcrastinate tasks\nfetch · store · flush · outbox"]
+    end
+
+    subgraph Core ["verigence-audit-core"]
+        C1["Evidence Service\nPOST /internal/evidence"]
+    end
+
+    subgraph DI ["verigence-di"]
+        D1["DI pipeline\nclassify · extract · validate"]
+    end
+
+    subgraph DB ["Shared Neon Postgres"]
+        DB1[(wa.* schemas)]
+        DB2[(doc.* schemas)]
+        DB3[(iam.* schemas)]
+    end
+
+    M1 -->|webhook| WA1
+    WA1 -->|Procrastinate| WA2
+    WA2 -->|HTTP POST| C1
+    C1 --> D1
+    WA1 & WA2 --- DB1 & DB2
+    C1 --- DB3
 ```
+
+> **Authentication setup**: see [`docs/authentication.md`](docs/authentication.md) for the full
+> WhatsApp account setup guide, integration steps, and a detailed walkthrough of how a
+> Process Consultant is authenticated on every inbound message.
 
 ### Database schemas
 
@@ -87,6 +91,8 @@ migrations/
 tests/
   fake_meta/__init__.py  # FakeMetaTransport + payload builders
   test_whatsapp_cycle.py # 12 test classes (all critical paths)
+docs/
+  authentication.md      # WhatsApp setup + user authentication guide
 Dockerfile               # api service image
 Dockerfile.worker        # worker service image
 railway.toml             # api Railway config
@@ -97,33 +103,42 @@ railway.worker.toml      # worker Railway config
 
 ## Booking + delivery cycle
 
-```
-1.  PC sends documents to WhatsApp number
-        │
-2.  Meta → POST /wa/webhook
-    └── HMAC verified, 200 returned immediately, wa.inbox row written
-        │
-3.  worker: process_inbox_row
-    ├── resolve_full_context (phone → tenant → contact → org_unit)
-    ├── get_or_create_session (90s debounce timer on flush_at)
-    └── per media message: register_file → dispatch fetch_and_store_file
-        │
-4.  worker: fetch_and_store_file (one Procrastinate task per file)
-    ├── fetch_media (streaming, SHA-256, ≤4 attempts before Meta limit)
-    ├── redact (if WA_REDACTION_ENABLED=true and Aadhaar document)
-    └── store_via_audit_core (HTTP → /internal/evidence → DI pipeline)
-        │
-5.  Scheduler (every 60s): flush_ready_sessions
-    └── claim sessions where flush_at < now() → dispatch process_session
-        │
-6.  worker: process_session
-    ├── find_existing_deal (exact booking_number → fuzzy customer_name)
-    ├── create_provisional_deal if no match (cold start)
-    ├── enqueue interactive confirm button → PC on WhatsApp
-    └── on PC confirmation: confirm_deal → initialise_checklist → gap message
-        │
-7.  Scheduler (every 60s): send_outbox
-    └── claim_pending (SKIP LOCKED) → WaClient.send_* → mark_sent/failed
+```mermaid
+sequenceDiagram
+    actor PC as Process Consultant
+    participant WA as WhatsApp / Meta
+    participant API as wa-api
+    participant W as wa-worker
+    participant Core as audit-core
+
+    PC->>WA: Sends booking + delivery documents
+    WA->>API: POST /wa/webhook (HMAC signed)
+    API->>API: Verify HMAC signature
+    API->>API: INSERT wa.inbox
+    API-->>WA: 200 OK (immediate)
+    API->>W: dispatch process_inbox_row
+
+    W->>W: resolve_route() → tenant
+    W->>W: resolve_contact() → user + org_unit
+    W->>W: SET LOCAL app.tenant_id (RLS)
+    W->>W: get_or_create_session() 90s debounce
+
+    loop Each media file
+        W->>WA: fetch_media() streaming download
+        W->>W: SHA-256 verify
+        W->>W: redact() if Aadhaar
+        W->>Core: POST /internal/evidence
+        Core-->>W: 201 evidenceId
+    end
+
+    Note over W: Debounce expires (flush_at < now)
+    W->>W: process_session()
+    W->>W: find/create deal (cold-start + fuzzy dedup)
+    W->>PC: Interactive confirm button
+    PC->>WA: Confirms deal
+    WA->>API: POST /wa/webhook (button reply)
+    W->>W: confirm_deal() + initialise_checklist()
+    W->>PC: Gap message (received ✓ / still missing)
 ```
 
 ---
@@ -188,6 +203,8 @@ WA_DI_SLA_MINUTES=15                # park session if DI result not received
        (phone_e164, user_id, tenant_id, org_unit_id, status, locale)
    VALUES ('+91XXXXXXXXXX', '<user_uuid>', '<tenant_uuid>', '<org_unit_uuid>', 'active', 'en');
    ```
+
+See [`docs/authentication.md`](docs/authentication.md) for the complete setup guide.
 
 ---
 
