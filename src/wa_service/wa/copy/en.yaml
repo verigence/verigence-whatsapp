@@ -1,0 +1,60 @@
+# Verigence WhatsApp — English copy
+# All text is non-PII. No amounts, names, account numbers, or doc contents.
+
+welcome: |
+  Welcome to Verigence Evidence Capture.
+  Please send your deal documents one by one.
+  Send the booking form first if you have it.
+
+file_received: "Got it. Keep sending — I'll process everything together."
+
+debounce_flushing: "Thanks, processing your submission now..."
+
+deal_confirm_header: "Confirm Deal"
+deal_confirm_body: |
+  I found the following deal from your documents:
+    Booking: {booking_number}
+    Vehicle: {model}
+    Customer: {customer_name}
+  Is this correct?
+deal_confirm_yes: "Yes, confirm"
+deal_confirm_no: "No, re-submit"
+
+deal_confirmed: "Deal confirmed. Checking your documents against the requirements..."
+
+gaps_header: "Submission Summary"
+gaps_complete: |
+  ✅ All required documents received for booking {booking_number}.
+  Your submission is complete.
+gaps_missing: |
+  Documents received:
+  {received_list}
+
+  Still required:
+  {missing_list}
+
+  Please send the missing documents when ready.
+
+retake_request: |
+  The following document was unclear and needs to be re-sent:
+  • {doc_name}
+  Please photograph it clearly, ensuring all four corners are visible.
+
+escalated: |
+  Your submission has been escalated to your Team Leader.
+  Reference: {session_id}
+  They will contact you shortly.
+
+parked: |
+  Your session has been parked. Your documents are safe.
+  Reference: {session_id}
+  Please contact your Team Leader if you need assistance.
+
+error_unbound: |
+  Your number is not registered with Verigence.
+  Please contact your Team Leader to set up access.
+
+error_generic: |
+  Something went wrong processing your message.
+  Reference: {correlation_id}
+  Please try again or contact your Team Leader.
