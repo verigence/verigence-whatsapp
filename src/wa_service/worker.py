@@ -16,16 +16,23 @@ Task flow for the booking + delivery cycle:
          fetch_and_store_file task (one per file)
        ↓
   fetch_and_store_file
-    ├─ fetch_media (streaming, SHA-256)
-    └─ store_via_audit_core (HTTP POST to audit-core evidence endpoint)
-         DI handles classification, extraction, and Aadhaar redaction
-         (redaction runs inside DI between classify and extract — D-08)
+    ├─ fetch_media  (streaming, SHA-256 verified)
+    ├─ store_via_audit_core  (HTTP POST → audit-core evidence endpoint)
+    │     audit-core → DI: classify, redact (D-08), extract
+    └─ poll_di_document  (deferred, starts AWAITING_DI loop)
+       ↓
+  poll_di_document
+    ├─ poll audit-core for DI processing status
+    ├─ on CONFIRMED: write document_type_key + di_facts to wa.file
+    ├─ call mark_satisfied() for the deal checklist
+    └─ once ALL files polled → defer process_session
        ↓
   flush_ready_sessions (scheduler, every 60 s)
     └─ claim_sessions_for_flush → process_session task per session
        ↓
   process_session
-    ├─ all files stored? → find/create deal (cold start)
+    ├─ read booking fields from wa.file.di_facts (BOOKING_FORM)
+    ├─ find/create deal (cold start dedup)
     ├─ enqueue deal-confirm interactive button reply
     └─ on PC confirmation → confirm_deal, initialise_checklist, gap message
        ↓
@@ -54,6 +61,13 @@ from wa_service.deal.checklist import (
     build_checklist,
     format_gap_message,
     initialise_checklist,
+    mark_satisfied,
+)
+from wa_service.media.di_poll import (
+    BookingFields,
+    DiPollError,
+    fetch_booking_fields,
+    poll_evidence_status,
 )
 from wa_service.media.fetch import MediaFetchError, fetch_media
 from wa_service.media.store import StoreError, store_via_audit_core
@@ -78,6 +92,11 @@ logger = structlog.get_logger(__name__)
 # Procrastinate app (import here to avoid circular imports with main.py)
 # ---------------------------------------------------------------------------
 from wa_service.procrastinate_app import app as proc_app  # noqa: E402
+
+# Max DI poll attempts per file before we park the session (AWAITING_DI SLA)
+_MAX_DI_POLL_ATTEMPTS = 7
+# Fibonacci backoff delays in seconds: 3, 5, 8, 13, 21, 34, 55
+_DI_POLL_DELAYS = (3, 5, 8, 13, 21, 34, 55)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +183,19 @@ def _process_messages(
         {"sid": session_id},
     ).scalar_one()
 
+    # Fetch intake_journey_id from wa.route for this session's tenant
+    rrow = conn.execute(
+        text(
+            "SELECT r.intake_journey_id FROM wa.route r"
+            " JOIN wa.contact c ON c.tenant_id = r.tenant_id"
+            " JOIN wa.session s ON s.contact_id = c.id"
+            " WHERE s.id = :sid AND r.active = true"
+            " LIMIT 1"
+        ),
+        {"sid": session_id},
+    ).mappings().one_or_none()
+    intake_journey_id = str(rrow["intake_journey_id"]) if rrow and rrow["intake_journey_id"] else None
+
     for msg in messages:
         msg_type = msg.get("type", "")
         if msg_type not in ("image", "document"):
@@ -204,6 +236,7 @@ def _process_messages(
                 user_id=str(ctx.user_id),
                 org_unit_id=str(ctx.org_unit_id),
                 locale=ctx.locale,
+                intake_journey_id=intake_journey_id,
             )
         )
 
@@ -222,6 +255,7 @@ def fetch_and_store_file(
     user_id: str,
     org_unit_id: str,
     locale: str = "en",
+    intake_journey_id: str | None = None,
 ) -> None:
     from sqlalchemy import text
 
@@ -229,9 +263,37 @@ def fetch_and_store_file(
     engine = get_engine()
     _file_id = UUID(file_id)
     _tenant_id = UUID(tenant_id)
-    _user_id = UUID(user_id)
-    _org_unit_id = UUID(org_unit_id)
     _session_id = UUID(session_id)
+
+    # Resolve intake_journey_id if not passed (fallback: look up from wa.route)
+    if intake_journey_id is None:
+        with engine.connect() as conn:
+            rrow = conn.execute(
+                text(
+                    "SELECT r.intake_journey_id FROM wa.route r"
+                    " JOIN wa.contact c ON c.tenant_id = r.tenant_id"
+                    " JOIN wa.session s ON s.contact_id = c.id"
+                    " WHERE s.id = :sid AND r.active = true"
+                    " LIMIT 1"
+                ),
+                {"sid": _session_id},
+            ).mappings().one_or_none()
+            if rrow and rrow["intake_journey_id"]:
+                intake_journey_id = str(rrow["intake_journey_id"])
+
+    if not intake_journey_id:
+        logger.error(
+            "wa_no_intake_journey",
+            session_id=session_id,
+            file_id=file_id,
+        )
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE wa.file SET state = 'failed', error_code = 'NO_INTAKE_JOURNEY'"
+                     " WHERE id = :fid"),
+                {"fid": _file_id},
+            )
+        return
 
     with engine.begin() as conn:
         frow = conn.execute(
@@ -267,7 +329,7 @@ def fetch_and_store_file(
         return
 
     # Store via audit-core HTTP. DI receives the raw bytes and handles
-    # classification, Aadhaar redaction, and extraction internally.
+    # classification, Aadhaar redaction (D-08), and extraction internally.
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE wa.file SET state = 'storing' WHERE id = :fid"),
@@ -280,16 +342,12 @@ def fetch_and_store_file(
                 settings.audit_core_internal_token.get_secret_value()
             ),
             tenant_id=_tenant_id,
-            journey_id=None,  # cold start — linked after deal confirmation
+            journey_id=UUID(intake_journey_id),
             wamid=frow["wamid"],
             session_correlation_id=str(_session_id),
-            user_id=_user_id,
-            org_unit_id=_org_unit_id,
             content=result.content,
             declared_name=frow["declared_name"],
             mime=result.mime,
-            sha256=result.sha256,
-            fidelity=frow["fidelity"],
         )
     except StoreError as exc:
         with engine.begin() as conn:
@@ -301,19 +359,232 @@ def fetch_and_store_file(
         logger.error("wa_file_store_failed", file_id=file_id, code=exc.code)
         return
 
+    # Persist the evidence_id; document_type_key populated by poll_di_document
     with engine.begin() as conn:
         conn.execute(
-            text("UPDATE wa.file SET state = 'stored', local_sha256 = :sha,"
-                 " byte_size = :size, stored_at = now(),"
-                 " storage_uri = :uri WHERE id = :fid"),
+            text(
+                "UPDATE wa.file SET state = 'stored', local_sha256 = :sha,"
+                " byte_size = :size, stored_at = now(),"
+                " storage_uri = :uri,"
+                " di_document_id = :di_doc_id"
+                " WHERE id = :fid"
+            ),
             {
                 "sha": result.sha256,
                 "size": result.byte_size,
                 "uri": str(store_result.evidence_id),
+                "di_doc_id": store_result.evidence_id,
                 "fid": _file_id,
             },
         )
-    logger.info("wa_file_stored", file_id=file_id, evidence_id=str(store_result.evidence_id))
+    logger.info(
+        "wa_file_stored",
+        file_id=file_id,
+        evidence_id=str(store_result.evidence_id),
+        processing_status=store_result.processing_status,
+    )
+
+    # Kick off DI poll — runs with Fibonacci backoff until terminal or SLA breach
+    asyncio.get_event_loop().run_until_complete(
+        proc_app.tasks["poll_di_document"].defer_async(
+            file_id=file_id,
+            session_id=session_id,
+            tenant_id=tenant_id,
+            journey_id=intake_journey_id,
+            evidence_id=str(store_result.evidence_id),
+            attempt=0,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task: poll DI for document processing status (AWAITING_DI state)
+# Runs after fetch_and_store_file succeeds. Re-defers itself with Fibonacci
+# backoff until DI reaches a terminal status or the SLA limit is reached.
+# ---------------------------------------------------------------------------
+@proc_app.task(name="poll_di_document", retry=0, pass_context=False)
+def poll_di_document(
+    file_id: str,
+    session_id: str,
+    tenant_id: str,
+    journey_id: str,
+    evidence_id: str,
+    attempt: int = 0,
+) -> None:
+    from sqlalchemy import text
+
+    settings = get_settings()
+    engine = get_engine()
+    _file_id = UUID(file_id)
+    _tenant_id = UUID(tenant_id)
+    _journey_id = UUID(journey_id)
+    _evidence_id = UUID(evidence_id)
+    _session_id = UUID(session_id)
+
+    try:
+        poll = poll_evidence_status(
+            audit_core_base_url=settings.audit_core_base_url,
+            audit_core_internal_token=settings.audit_core_internal_token.get_secret_value(),
+            tenant_id=_tenant_id,
+            journey_id=_journey_id,
+            evidence_id=_evidence_id,
+        )
+    except DiPollError as exc:
+        logger.warning(
+            "di_poll_error", file_id=file_id, code=exc.code, attempt=attempt
+        )
+        if not exc.retryable or attempt >= _MAX_DI_POLL_ATTEMPTS - 1:
+            _park_on_di_sla(engine, _session_id, f"DI poll error: {exc.code}")
+            return
+        _reschedule_poll(file_id, session_id, tenant_id, journey_id, evidence_id, attempt)
+        return
+
+    if not poll.is_terminal:
+        if attempt >= _MAX_DI_POLL_ATTEMPTS - 1:
+            logger.warning(
+                "di_poll_sla_exceeded",
+                file_id=file_id,
+                evidence_id=evidence_id,
+                attempts=attempt + 1,
+            )
+            _park_on_di_sla(engine, _session_id, "AWAITING_DI SLA exceeded")
+            return
+        _reschedule_poll(file_id, session_id, tenant_id, journey_id, evidence_id, attempt)
+        return
+
+    # --- Terminal status reached ---
+    doc_type_key = poll.document_type_key
+    di_facts: dict = {}
+
+    # For BOOKING_FORM: fetch extracted facts for cold-start deal resolution
+    if doc_type_key == "BOOKING_FORM" and poll.processing_status in ("CONFIRMED", "VERIFIED"):
+        try:
+            booking = fetch_booking_fields(
+                audit_core_base_url=settings.audit_core_base_url,
+                audit_core_internal_token=settings.audit_core_internal_token.get_secret_value(),
+                tenant_id=_tenant_id,
+                journey_id=_journey_id,
+                evidence_id=_evidence_id,
+            )
+            di_facts = booking.raw_facts
+        except DiPollError as exc:
+            logger.warning("di_facts_fetch_error", file_id=file_id, code=exc.code)
+
+    # Persist document_type_key and di_facts on wa.file
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE wa.file"
+                " SET document_type_key = :dtk,"
+                "     di_facts = CAST(:facts AS jsonb)"
+                " WHERE id = :fid"
+            ),
+            {
+                "dtk": doc_type_key,
+                "facts": json.dumps(di_facts),
+                "fid": _file_id,
+            },
+        )
+
+    # Mark checklist item satisfied if deal is already linked to the session
+    if doc_type_key and poll.processing_status in ("CONFIRMED", "VERIFIED"):
+        with engine.begin() as conn:
+            srow = conn.execute(
+                text("SELECT deal_id, tenant_id FROM wa.session WHERE id = :sid"),
+                {"sid": _session_id},
+            ).mappings().one_or_none()
+
+        if srow and srow["deal_id"]:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("SET LOCAL app.tenant_id = :tid"),
+                    {"tid": str(srow["tenant_id"])},
+                )
+                mark_satisfied(
+                    conn,
+                    deal_id=UUID(str(srow["deal_id"])),
+                    type_key=doc_type_key,
+                    document_id=_evidence_id,
+                )
+
+    logger.info(
+        "di_poll_terminal",
+        file_id=file_id,
+        evidence_id=evidence_id,
+        document_type_key=doc_type_key,
+        processing_status=poll.processing_status,
+        attempts=attempt + 1,
+    )
+
+    # Check if ALL files in the session have been polled
+    # If so, nudge the session flush so process_session runs without waiting
+    # for the 60-second scheduler.
+    with engine.begin() as conn:
+        pending_count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM wa.file"
+                " WHERE session_id = :sid"
+                "   AND state = 'stored'"
+                "   AND document_type_key IS NULL"
+            ),
+            {"sid": _session_id},
+        ).scalar_one()
+
+    if pending_count == 0:
+        # All files polled — advance session flush timer to now so the
+        # scheduler picks it up in the next 60-second tick
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE wa.session"
+                    " SET flush_at = now()"
+                    " WHERE id = :sid"
+                    "   AND state IN ('collecting', 'confirming_deal', 'processing')"
+                ),
+                {"sid": _session_id},
+            )
+        logger.info("di_all_files_polled_flush_advanced", session_id=session_id)
+
+
+def _reschedule_poll(
+    file_id: str,
+    session_id: str,
+    tenant_id: str,
+    journey_id: str,
+    evidence_id: str,
+    attempt: int,
+) -> None:
+    """Re-defer poll_di_document with Fibonacci backoff."""
+    next_attempt = attempt + 1
+    delay = _DI_POLL_DELAYS[min(attempt, len(_DI_POLL_DELAYS) - 1)]
+    asyncio.get_event_loop().run_until_complete(
+        proc_app.tasks["poll_di_document"].defer_async(
+            file_id=file_id,
+            session_id=session_id,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            evidence_id=evidence_id,
+            attempt=next_attempt,
+            schedule_in={"seconds": delay},
+        )
+    )
+    logger.info(
+        "di_poll_rescheduled",
+        file_id=file_id,
+        attempt=next_attempt,
+        delay_seconds=delay,
+    )
+
+
+def _park_on_di_sla(engine, session_id: UUID, note: str) -> None:
+    """Park the session when DI SLA is exceeded."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE wa.session SET state = 'parked', note = :note WHERE id = :sid"),
+            {"note": note, "sid": session_id},
+        )
+    logger.warning("session_parked_di_sla", session_id=str(session_id), note=note)
 
 
 # ---------------------------------------------------------------------------
@@ -360,40 +631,60 @@ def process_session(session_id: str) -> None:
         files = get_session_files(conn, session_id=_session_id)
         all_stored = all(f["state"] == "stored" for f in files)
         if not all_stored:
-            # Not all files are ready — re-park, retry later
+            # Not all files ready — re-park, retry later
             park_session(conn, session_id=_session_id, note="files_not_ready")
             return
 
-        # Cold-start deal discovery
+        # Check that all files have been through DI poll (document_type_key populated)
+        all_polled = all(f.get("document_type_key") is not None for f in files)
+        if not all_polled:
+            # DI still processing — re-park; poll_di_document will advance flush_at
+            park_session(conn, session_id=_session_id, note="awaiting_di")
+            return
+
+        # Extract booking fields from the BOOKING_FORM file's di_facts
+        booking_fields = _extract_booking_fields(files)
+
+        # Cold-start deal discovery using real DI-extracted booking data
         match = find_existing_deal(
             conn,
             tenant_id=_tenant_id,
-            booking_number="UNKNOWN",  # real booking_number extracted by DI
-            customer_name=None,
-            model=None,
-            booking_date=None,
+            booking_number=booking_fields.booking_number or f"WA-{str(_session_id)[:8].upper()}",
+            customer_name=booking_fields.customer_name,
+            model=booking_fields.model,
+            booking_date=booking_fields.booking_date,
         )
 
         if match is None:
             # Create provisional deal — PC must confirm
+            booking_number = (
+                booking_fields.booking_number
+                or f"WA-{str(_session_id)[:8].upper()}"
+            )
+            # Infer deal type from flags extracted from the booking form
+            deal_type = _infer_deal_type(booking_fields)
+
             deal = create_provisional_deal(
                 conn,
                 tenant_id=_tenant_id,
                 org_unit_id=_org_unit_id,
-                booking_number=f"WA-{str(_session_id)[:8].upper()}",
-                customer_name="(pending)",
+                booking_number=booking_number,
+                customer_name=booking_fields.customer_name or "(pending)",
                 customer_mobile=None,
-                model=None,
-                variant=None,
-                booking_date=None,
-                deal_type="retail",
-                is_financed=False,
-                has_exchange=False,
-                is_corporate=False,
+                model=booking_fields.model,
+                variant=booking_fields.variant,
+                booking_date=booking_fields.booking_date,
+                deal_type=deal_type,
+                is_financed=booking_fields.is_financed,
+                has_exchange=booking_fields.has_exchange,
+                is_corporate=booking_fields.is_corporate,
                 created_by=_contact_id,
             )
-            initialise_checklist(conn, deal_id=deal.deal_id, deal_type="retail")
+            initialise_checklist(conn, deal_id=deal.deal_id, deal_type=deal_type)
             transition_to_confirming(conn, session_id=_session_id, deal_id=deal.deal_id)
+
+            # Satisfy checklist items for all already-confirmed documents
+            _satisfy_confirmed_files(conn, deal.deal_id, files)
 
             # Fetch contact locale for reply
             crow = conn.execute(
@@ -437,10 +728,75 @@ def process_session(session_id: str) -> None:
             park_session(conn, session_id=_session_id, note="deal_ambiguous")
         else:
             # Exact match — confirm and send gap message
-            confirm_deal(conn, tenant_id=_tenant_id,
-                         deal_id=match.deal_id, confirmed_by=_contact_id)
-            _send_gap_message(conn, _session_id, _tenant_id, _contact_id,
-                              match.deal_id, settings)
+            confirm_deal(
+                conn, tenant_id=_tenant_id,
+                deal_id=match.deal_id, confirmed_by=_contact_id
+            )
+            # Satisfy checklist for files already confirmed
+            _satisfy_confirmed_files(conn, match.deal_id, files)
+            _send_gap_message(
+                conn, _session_id, _tenant_id, _contact_id,
+                match.deal_id, settings
+            )
+
+
+def _extract_booking_fields(files: list) -> "BookingFields":
+    """Find the BOOKING_FORM file and return its extracted fields."""
+    for f in files:
+        if f.get("document_type_key") == "BOOKING_FORM":
+            raw = f.get("di_facts") or {}
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    raw = {}
+
+            def _bool(k: str) -> bool:
+                v = str(raw.get(k, "")).lower()
+                return v in ("true", "yes", "1", "y")
+
+            return BookingFields(
+                booking_number=raw.get("BOOKING_NUMBER"),
+                customer_name=raw.get("CUSTOMER_NAME"),
+                model=raw.get("MODEL"),
+                variant=raw.get("VARIANT"),
+                booking_date=raw.get("BOOKING_DATE"),
+                is_financed=_bool("FINANCE_FLAG"),
+                has_exchange=_bool("EXCHANGE_FLAG"),
+                is_corporate=_bool("CORPORATE_FLAG"),
+                raw_facts=raw,
+            )
+    return BookingFields()
+
+
+def _infer_deal_type(bf: "BookingFields") -> str:
+    """Derive deal_type from booking form flags."""
+    if bf.is_corporate:
+        return "corporate"
+    if bf.is_financed:
+        return "retail_financed"
+    if bf.has_exchange:
+        return "retail_exchange"
+    return "retail"
+
+
+def _satisfy_confirmed_files(
+    conn, deal_id: UUID, files: list
+) -> None:
+    """Mark checklist items satisfied for all CONFIRMED/VERIFIED files."""
+    for f in files:
+        dtk = f.get("document_type_key")
+        di_doc_id = f.get("di_document_id")
+        if dtk and di_doc_id:
+            try:
+                mark_satisfied(
+                    conn,
+                    deal_id=deal_id,
+                    type_key=dtk,
+                    document_id=UUID(str(di_doc_id)),
+                )
+            except Exception:  # noqa: BLE001
+                pass  # checklist item may not exist for this doc type
 
 
 def _send_gap_message(
