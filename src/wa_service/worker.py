@@ -17,8 +17,9 @@ Task flow for the booking + delivery cycle:
        ↓
   fetch_and_store_file
     ├─ fetch_media (streaming, SHA-256)
-    ├─ redact (if enabled + Aadhaar)
-    └─ store_via_audit_core (HTTP POST to audit-core /internal/evidence)
+    └─ store_via_audit_core (HTTP POST to audit-core evidence endpoint)
+         DI handles classification, extraction, and Aadhaar redaction
+         (redaction runs inside DI between classify and extract — D-08)
        ↓
   flush_ready_sessions (scheduler, every 60 s)
     └─ claim_sessions_for_flush → process_session task per session
@@ -44,7 +45,6 @@ import structlog
 from wa_service.config import get_settings
 from wa_service.db import get_engine
 from wa_service.deal.builder import (
-    DealMatch,
     confirm_deal,
     create_provisional_deal,
     find_existing_deal,
@@ -56,7 +56,6 @@ from wa_service.deal.checklist import (
     initialise_checklist,
 )
 from wa_service.media.fetch import MediaFetchError, fetch_media
-from wa_service.media.redact import redact_image_bytes
 from wa_service.media.store import StoreError, store_via_audit_core
 from wa_service.wa.client import WaApiError, get_wa_client
 from wa_service.wa.copy import load_copy
@@ -210,7 +209,10 @@ def _process_messages(
 
 
 # ---------------------------------------------------------------------------
-# Task: fetch + redact + store one file
+# Task: fetch + store one file
+# Redaction is NOT performed here. It runs inside DI between classify and
+# extract (design decision D-08). Classification must happen first, and only
+# DI knows the document type.
 # ---------------------------------------------------------------------------
 @proc_app.task(name="fetch_and_store_file", retry=3, pass_context=False)
 def fetch_and_store_file(
@@ -264,22 +266,8 @@ def fetch_and_store_file(
             raise  # Procrastinate will not retry on re-raise
         return
 
-    # Redact if enabled
-    content = result.content
-    if settings.wa_redaction_enabled:
-        with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE wa.file SET state = 'redacting' WHERE id = :fid"),
-                {"fid": _file_id},
-            )
-        try:
-            content, _ = redact_image_bytes(
-                content, mime=result.mime, document_type_key="AADHAAR"
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("wa_redact_skipped", file_id=file_id, error=str(exc))
-
-    # Store via audit-core HTTP
+    # Store via audit-core HTTP. DI receives the raw bytes and handles
+    # classification, Aadhaar redaction, and extraction internally.
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE wa.file SET state = 'storing' WHERE id = :fid"),
@@ -297,7 +285,7 @@ def fetch_and_store_file(
             session_correlation_id=str(_session_id),
             user_id=_user_id,
             org_unit_id=_org_unit_id,
-            content=content,
+            content=result.content,
             declared_name=frow["declared_name"],
             mime=result.mime,
             sha256=result.sha256,
@@ -407,7 +395,7 @@ def process_session(session_id: str) -> None:
             initialise_checklist(conn, deal_id=deal.deal_id, deal_type="retail")
             transition_to_confirming(conn, session_id=_session_id, deal_id=deal.deal_id)
 
-            # Fetch contact locale + phone for reply
+            # Fetch contact locale for reply
             crow = conn.execute(
                 text("SELECT locale FROM wa.contact WHERE id = :cid"),
                 {"cid": _contact_id},
@@ -507,7 +495,6 @@ def send_outbox(timestamp: datetime) -> None:
             ).mappings().one_or_none()
             if crow is None:
                 continue
-            # Get route phone_number_id for this tenant
             rrow = conn.execute(
                 __import__("sqlalchemy", fromlist=["text"]).text(
                     "SELECT phone_number_id FROM wa.route"
