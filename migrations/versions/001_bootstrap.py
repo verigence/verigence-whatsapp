@@ -13,7 +13,7 @@ down_revision = None
 branch_labels = None
 depends_on = None
 
-_SQL = (Path(__file__).parent.parent / "migrations" / "001_wa_schema.sql").read_text()
+_SQL = (Path(__file__).parent.parent / "001_wa_schema.sql").read_text()
 
 
 def upgrade() -> None:

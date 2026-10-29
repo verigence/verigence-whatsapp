@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
+from wa_service.api.routes import router as api_router
 from wa_service.config import get_settings
 from wa_service.db import check_db_rtt, get_engine
 from wa_service.wa.client import WaClient, set_wa_client, clear_wa_client
@@ -52,6 +53,7 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
     application.include_router(webhook_router)
+    application.include_router(api_router)
 
     @application.get("/health")
     def health() -> dict[str, str]:

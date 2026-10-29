@@ -13,7 +13,7 @@ down_revision = "001"
 branch_labels = None
 depends_on = None
 
-_SQL_FILE = Path(__file__).parent.parent / "migrations" / "002_wa_file_di_columns.sql"
+_SQL_FILE = Path(__file__).parent.parent / "002_wa_file_di_columns.sql"
 
 
 def upgrade() -> None:
