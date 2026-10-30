@@ -91,7 +91,7 @@ def resolve_full_context(
     org_unit_id = UUID(str(contact["org_unit_id"]))
 
     # Scopes all subsequent RLS-protected reads in this connection
-    conn.execute(text("SET LOCAL app.tenant_id = :tid"), {"tid": str(tenant_id)})
+    conn.execute(text("SELECT set_config('app.tenant_id', :tid, true)"), {"tid": str(tenant_id)})
 
     logger.info(
         "wa_context_resolved",

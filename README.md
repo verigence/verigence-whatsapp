@@ -47,6 +47,12 @@ flowchart TD
 > WhatsApp account setup guide, integration steps, and a detailed walkthrough of how a
 > Process Consultant is authenticated on every inbound message.
 
+### HTTP API for other modules
+
+Other Verigence modules send WhatsApp messages and manage routes/contacts through the
+token-authenticated `/v1` API. See [`docs/api.md`](docs/api.md); the contract is served at `GET /v1/openapi.json`.
+Set `WA_API_TOKENS=caller:token,…` on the `wa-api` service.
+
 ### Database schemas
 
 | Schema | Owner | Tables |
@@ -168,6 +174,9 @@ DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
 WA_APP_SECRET=<app_secret_from_meta>
 WA_ACCESS_TOKEN=<permanent_system_user_token>
 WA_VERIFY_TOKEN=<your_chosen_verify_token>
+
+# Public /v1 API: one token per calling module (empty = API disabled)
+WA_API_TOKENS=audit-core:<secret>,security:<secret>
 
 # Audit Core internal evidence upload
 AUDIT_CORE_BASE_URL=https://your-audit-core.railway.app

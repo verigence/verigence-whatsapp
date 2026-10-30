@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     # Service-to-service bearer token for internal calls to audit-core
     audit_core_internal_token: SecretStr = Field(default=SecretStr(""))
 
+    # ---- Public HTTP API (/v1) ---------------------------------------------
+    # Comma-separated "caller:token" pairs, e.g. "audit-core:abc123,security:def456".
+    # Empty = the /v1 API is disabled (503). Tokens are service-to-service secrets.
+    wa_api_tokens: SecretStr = Field(default=SecretStr(""))
+
     # ---- Behaviour tuning -------------------------------------------------
     wa_debounce_seconds: int = Field(default=90, ge=10, le=600)
     wa_media_concurrent_per_contact: int = Field(default=3, ge=1, le=10)
@@ -44,11 +49,26 @@ class Settings(BaseSettings):
 
     model_config = {"env_prefix": "", "case_sensitive": False}
 
+    @property
+    def api_callers(self) -> dict[str, str]:
+        """token -> caller name, parsed from WA_API_TOKENS."""
+        out: dict[str, str] = {}
+        for pair in self.wa_api_tokens.get_secret_value().split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            name, sep, token = pair.partition(":")
+            if not sep or not name.strip() or not token.strip():
+                raise ValueError("WA_API_TOKENS entries must look like caller:token")
+            out[token.strip()] = name.strip()
+        return out
+
     @model_validator(mode="after")
     def _secrets_non_empty(self) -> "Settings":
         for name in ("wa_app_secret", "wa_access_token", "wa_verify_token"):
             if not getattr(self, name).get_secret_value().strip():
                 raise ValueError(f"{name} must not be empty")
+        self.api_callers  # fail fast on a malformed WA_API_TOKENS
         return self
 
 
